@@ -1,0 +1,441 @@
+// ==UserScript==
+// @name         CyTube GoFile Pro 
+// @namespace    http://tampermonkey.net/
+// @version      1.0
+// @description  Recursive scanning, persistent storage, multi-folder session caching, custom video titling, and improved GoFile UI integration
+// @author       LoopRook
+// @match        https://cytu.be/r/*
+// @match        https://gofile.io/*
+// @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_setClipboard
+// @run-at       document-end
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // --- CONFIGURATION & STATE ---
+
+    const QUEUE_DELAY_MS = 2500;
+    const MAX_HISTORY = 10;
+
+    let GOFILE_TOKEN = GM_getValue("GOFILE_TOKEN", "");
+    let FOLDERS = JSON.parse(GM_getValue("FOLDERS", "[]"));
+    let multiFolderCache = {};
+    let history = [];
+
+    // --- INITIALIZATION ---
+
+    if (window.location.hostname === 'cytu.be') {
+        initCyTubeUI();
+    } else if (window.location.hostname === 'gofile.io') {
+        initGoFileUI();
+    }
+
+    function initCyTubeUI() {
+        const uiWrapper = document.createElement('div');
+        uiWrapper.style.display = 'inline-flex';
+        uiWrapper.style.flexWrap = 'wrap';
+        uiWrapper.style.gap = '5px';
+        uiWrapper.style.rowGap = '5px';
+        uiWrapper.style.marginLeft = '10px';
+        uiWrapper.style.alignItems = 'center';
+        uiWrapper.style.maxWidth = '100%';
+
+        const folderSelect = document.createElement('select');
+        folderSelect.className = 'btn btn-sm btn-default';
+
+        const countInput = document.createElement('input');
+        countInput.type = 'number';
+        countInput.value = 1;
+        countInput.min = 1;
+        countInput.max = 50;
+        countInput.className = 'btn btn-sm btn-default';
+        countInput.style.width = '65px';
+        countInput.style.textAlign = 'center';
+        countInput.style.padding = '5px';
+
+        const posSelect = document.createElement('select');
+        posSelect.className = 'btn btn-sm btn-default';
+        posSelect.innerHTML = '<option value="next">Next</option><option value="end">Last</option>';
+
+        const btn = document.createElement('button');
+        btn.innerText = 'Queue Random';
+        btn.className = 'btn btn-sm btn-success';
+
+        const refreshBtn = document.createElement('button');
+        refreshBtn.innerHTML = '🔄';
+        refreshBtn.className = 'btn btn-sm btn-info';
+
+        const settingsBtn = document.createElement('button');
+        settingsBtn.innerHTML = '⚙️';
+        settingsBtn.className = 'btn btn-sm btn-default';
+
+        uiWrapper.append(folderSelect, countInput, posSelect, btn, refreshBtn, settingsBtn);
+
+        const container = document.getElementById('leftcontrols');
+        if (container) container.appendChild(uiWrapper);
+
+        const modal = document.createElement('div');
+        modal.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:#222;color:#fff;padding:20px;border-radius:8px;z-index:10001;display:none;width:400px;max-width:90%;border:1px solid #444;box-shadow: 0 4px 15px rgba(0,0,0,0.5);box-sizing:border-box;';
+        document.body.appendChild(modal);
+
+        const overlay = document.createElement('div');
+        overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:10000;display:none;';
+        document.body.appendChild(overlay);
+
+        const inputStyle = 'background:#333;border:1px solid #555;color:#fff;padding:4px;box-sizing:border-box;';
+
+        function updateFolderSelect() {
+            folderSelect.innerHTML = '';
+            FOLDERS.forEach(f => {
+                const opt = document.createElement('option');
+                opt.value = f.id;
+                opt.innerText = f.name;
+                folderSelect.appendChild(opt);
+            });
+        }
+
+        function renderSettings() {
+            modal.innerHTML = `
+                <h4 style="margin-top:0">GoFile Settings</h4>
+                <label style="display:block;margin-bottom:5px;">API Token:</label>
+                <input type="password" id="gf-token" value="${GOFILE_TOKEN}" style="width:100%;margin-bottom:15px;${inputStyle}">
+                <label style="display:block;margin-bottom:5px;">Folders:</label>
+                <div id="gf-folder-list" style="max-height:150px;overflow-y:auto;margin-bottom:10px;border:1px solid #444;padding:5px;box-sizing:border-box;"></div>
+                <div style="display:flex;gap:5px;margin-bottom:15px;width:100%;">
+                    <input type="text" id="new-f-name" placeholder="Name" style="flex:1;min-width:0;${inputStyle}">
+                    <input type="text" id="new-f-id" placeholder="ID" style="flex:1;min-width:0;${inputStyle}">
+                    <button id="gf-add-folder" class="btn btn-xs btn-primary" style="flex-shrink:0;">Add</button>
+                </div>
+                <div style="text-align:right;">
+                    <button id="gf-save" class="btn btn-sm btn-success">Save & Close</button>
+                    <button id="gf-close" class="btn btn-sm btn-danger">Cancel</button>
+                </div>
+            `;
+
+            const list = modal.querySelector('#gf-folder-list');
+            FOLDERS.forEach((f, i) => {
+                const row = document.createElement('div');
+                row.style.cssText = 'display:flex;justify-content:space-between;margin-bottom:3px;font-size:12px;align-items:center;';
+                row.innerHTML = `<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-right:5px;">${f.name}</span><button data-idx="${i}" class="gf-del btn btn-xs btn-danger" style="padding:0 6px;flex-shrink:0;">X</button>`;
+                list.appendChild(row);
+            });
+
+            modal.querySelectorAll('.gf-del').forEach(b => b.onclick = (e) => {
+                FOLDERS.splice(e.target.dataset.idx, 1);
+                renderSettings();
+            });
+
+            modal.querySelector('#gf-add-folder').onclick = () => {
+                const name = modal.querySelector('#new-f-name').value;
+                const id = modal.querySelector('#new-f-id').value;
+                if (name && id) {
+                    FOLDERS.push({ name, id });
+                    renderSettings();
+                }
+            };
+
+            modal.querySelector('#gf-save').onclick = () => {
+                GOFILE_TOKEN = modal.querySelector('#gf-token').value;
+                GM_setValue("GOFILE_TOKEN", GOFILE_TOKEN);
+                GM_setValue("FOLDERS", JSON.stringify(FOLDERS));
+                multiFolderCache = {};
+                updateFolderSelect();
+                closeModal();
+            };
+
+            modal.querySelector('#gf-close').onclick = closeModal;
+        }
+
+        function closeModal() {
+            modal.style.display = 'none';
+            overlay.style.display = 'none';
+        }
+
+        settingsBtn.onclick = () => {
+            modal.style.display = 'block';
+            overlay.style.display = 'block';
+            renderSettings();
+        };
+
+        refreshBtn.onclick = () => {
+            const folderId = folderSelect.value;
+            delete multiFolderCache[folderId];
+            history = [];
+            refreshBtn.innerText = 'OK';
+            setTimeout(() => refreshBtn.innerText = '🔄', 1000);
+        };
+
+        btn.onclick = async function() {
+            if (!GOFILE_TOKEN || FOLDERS.length === 0) {
+                alert("Please configure GoFile API token and Folders in the settings menu.");
+                return;
+            }
+            const folderId = folderSelect.value;
+            const amount = parseInt(countInput.value) || 1;
+            const position = posSelect.value;
+
+            this.disabled = true;
+
+            if (!multiFolderCache[folderId]) {
+                this.innerText = 'Scanning...';
+                multiFolderCache[folderId] = await performRecursiveScan(folderId, (text) => { this.innerText = text; });
+            }
+
+            const folderFiles = multiFolderCache[folderId];
+
+            if (folderFiles.length === 0) {
+                alert("No supported video files found.");
+                resetBtn();
+                return;
+            }
+
+            const selected = getWeightedSelection(folderFiles, amount);
+            this.innerText = `Queuing ${selected.length}...`;
+
+            for (const file of selected) {
+                await processFile(file.id, file.name, position);
+                await new Promise(r => setTimeout(r, QUEUE_DELAY_MS));
+            }
+            resetBtn();
+        };
+
+        function resetBtn() {
+            btn.disabled = false;
+            btn.innerText = 'Queue Random';
+        }
+
+        updateFolderSelect();
+    }
+
+    function initGoFileUI() {
+        const observer = new MutationObserver(() => {
+            const downloadIcons = document.querySelectorAll('.fa-download');
+
+            downloadIcons.forEach(icon => {
+                const downloadBtn = icon.closest('button') || icon.closest('a') || icon.parentElement;
+                if (!downloadBtn || downloadBtn.dataset.gfInjected) return;
+
+                downloadBtn.dataset.gfInjected = "true";
+
+                const copyBtn = document.createElement('button');
+                copyBtn.innerHTML = '🔗';
+                copyBtn.title = 'Copy Direct Link';
+                copyBtn.style.cssText = 'background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.2);border-radius:5px;cursor:pointer;margin-right:8px;padding:4px 10px;font-size:14px;color:#fff;transition:background 0.2s;';
+                copyBtn.onmouseover = () => { copyBtn.style.background = 'rgba(255,255,255,0.2)'; };
+                copyBtn.onmouseout = () => { copyBtn.style.background = 'rgba(255,255,255,0.1)'; };
+
+                copyBtn.onclick = async (e) => {
+                    e.stopPropagation();
+                    e.preventDefault();
+
+                    if (!GOFILE_TOKEN) {
+                        alert("Enter your GoFile API Token in Settings on the CyTube page.");
+                        return;
+                    }
+
+                    let fileId = null;
+                    const uuidRegex = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+
+                    let rowContainer = downloadBtn.closest('tr') ||
+                                       downloadBtn.closest('.border-b') ||
+                                       downloadBtn.closest('.flex.items-center') ||
+                                       downloadBtn.parentElement.parentElement.parentElement;
+
+                    if (rowContainer) {
+                        const match = rowContainer.outerHTML.match(uuidRegex);
+                        if (match && match.length > 0) {
+                            fileId = match[0];
+                        }
+                    }
+
+                    if (!fileId) {
+                        alert("Unable to detect GoFile file ID. The site structure may have hidden it.");
+                        return;
+                    }
+
+                    copyBtn.innerHTML = '⏳';
+
+                    try {
+                        const link = await getDirectLink(fileId);
+                        GM_setClipboard(link);
+                        copyBtn.innerHTML = '✅';
+                        copyBtn.title = 'Copied!';
+                    } catch (error) {
+                        copyBtn.innerHTML = '❌';
+                        copyBtn.title = 'API Error';
+                        console.error("GoFile API Error:", error);
+                    }
+
+                    setTimeout(() => {
+                        copyBtn.innerHTML = '🔗';
+                        copyBtn.title = 'Copy Direct Link';
+                    }, 3000);
+                };
+
+                if (downloadBtn.parentNode) {
+                    downloadBtn.parentNode.insertBefore(copyBtn, downloadBtn);
+                }
+            });
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+    }
+
+    function getFileKey(filename) {
+        return filename.split(/[ .\-_\[\(]/)[0].toLowerCase();
+    }
+
+    function getWeightedSelection(available, count) {
+        let selected = [];
+        let pool = [...available];
+        for (let i = 0; i < count; i++) {
+            if (pool.length === 0) break;
+            let weightedPool = pool.map(file => {
+                let weight = 100;
+                let key = getFileKey(file.name);
+                history.forEach(h => { if (getFileKey(h.name) === key) weight *= 0.1; });
+                selected.forEach(s => { if (getFileKey(s.name) === key) weight *= 0.05; });
+                return { file, weight };
+            });
+            let totalWeight = weightedPool.reduce((sum, item) => sum + item.weight, 0);
+            let random = Math.random() * totalWeight;
+            let current = 0;
+            let chosenIndex = 0;
+            for (let j = 0; j < weightedPool.length; j++) {
+                current += weightedPool[j].weight;
+                if (random <= current) { chosenIndex = j; break; }
+            }
+            let winner = weightedPool[chosenIndex].file;
+            selected.push(winner);
+            pool.splice(pool.indexOf(winner), 1);
+            history.push(winner);
+            if (history.length > MAX_HISTORY) history.shift();
+        }
+        return selected;
+    }
+
+    async function performRecursiveScan(rootId, onStatus) {
+        let allVideos = [];
+        let foldersToScan = [rootId];
+        while (foldersToScan.length > 0) {
+            const currentId = foldersToScan.shift();
+            try {
+                const data = await fetchFolderData(currentId);
+                if (data.status === 'ok') {
+                    const children = Object.values(data.data.children);
+                    for (const child of children) {
+                        if (child.type === 'file' && /\.(mp4|webm|mkv|mov)$/i.test(child.name)) {
+                            allVideos.push(child);
+                        } else if (child.type === 'folder') {
+                            foldersToScan.push(child.id);
+                        }
+                    }
+                }
+            } catch (e) {}
+            if (onStatus) onStatus(`Scanning (${allVideos.length} found)...`);
+        }
+        return allVideos;
+    }
+
+    function fetchFolderData(folderId) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: "GET",
+                url: `https://api.gofile.io/contents/${folderId}`,
+                headers: { "Authorization": `Bearer ${GOFILE_TOKEN}` },
+                onload: (res) => resolve(JSON.parse(res.responseText)),
+                onerror: (err) => reject(err)
+            });
+        });
+    }
+
+    function getDirectLink(fileId) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: "GET",
+                url: `https://api.gofile.io/contents/${fileId}`,
+                headers: { "Authorization": `Bearer ${GOFILE_TOKEN}` },
+                onload: function(res) {
+                    try {
+                        const data = JSON.parse(res.responseText);
+
+                        function findExistingLink(obj) {
+                            if (!obj || typeof obj !== 'object') return null;
+                            if (typeof obj.directLink === 'string' && obj.directLink.startsWith('http')) return obj.directLink;
+                            if (Array.isArray(obj.directLinks) && obj.directLinks.length > 0) {
+                                const first = obj.directLinks[0];
+                                if (typeof first === 'string' && first.startsWith('http')) return first;
+                                if (typeof first === 'object' && typeof first.link === 'string' && first.link.startsWith('http')) return first.link;
+                            }
+                            if (typeof obj.link === 'string' && obj.link.includes('/download/direct')) return obj.link;
+
+                            for (let key in obj) {
+                                if (typeof obj[key] === 'object') {
+                                    const found = findExistingLink(obj[key]);
+                                    if (found) return found;
+                                }
+                            }
+                            return null;
+                        }
+
+                        let existingLink = null;
+                        if (data.status === 'ok' && data.data) {
+                            existingLink = findExistingLink(data.data);
+                        }
+
+                        if (existingLink) {
+                            resolve(existingLink);
+                        } else {
+                            GM_xmlhttpRequest({
+                                method: "POST",
+                                url: `https://api.gofile.io/contents/${fileId}/directlinks`,
+                                headers: {
+                                    "Authorization": `Bearer ${GOFILE_TOKEN}`,
+                                    "Content-Type": "application/json"
+                                },
+                                data: "{}",
+                                onload: function(postRes) {
+                                    const postData = JSON.parse(postRes.responseText);
+                                    if (postData.status === 'ok' && postData.data && postData.data.directLink) {
+                                        resolve(postData.data.directLink);
+                                    } else {
+                                        reject(postData.status || "Failed to create link");
+                                    }
+                                },
+                                onerror: reject
+                            });
+                        }
+                    } catch (e) {
+                        reject(e);
+                    }
+                },
+                onerror: reject
+            });
+        });
+    }
+
+    function processFile(fileId, fileName, position) {
+        return new Promise(async (resolve) => {
+            try {
+                const link = await getDirectLink(fileId);
+                const socket = unsafeWindow.socket;
+                if (socket && socket.connected && link) {
+                    socket.emit("queue", {
+                        type: "fi",
+                        id: link,
+                        title: fileName,
+                        pos: position,
+                        temp: false
+                    });
+                }
+            } catch (e) {
+                console.error("GoFile Link Error:", e);
+            }
+            resolve();
+        });
+    }
+})();
